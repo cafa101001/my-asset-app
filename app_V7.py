@@ -121,6 +121,50 @@ def handle_login():
             st.error(f"❌ exchange_code_for_session 失敗：{e}")
             st.write("Query params:", params)
             st.stop()
+            
+def show_login_UI():
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.title("🔐 全球資產管理系統 V7.5")
+        st.markdown("### 請登入以存取您的個人資產數據")
+
+        try:
+            default_redirect_url = st.secrets["REDIRECT_URL"]
+        except Exception:
+            default_redirect_url = "http://localhost:8501"
+
+        with st.expander("⚙️ 設定登入回調網址 (若無法登入請檢查)", expanded=False):
+            redirect_url = st.text_input("Redirect URL", value=default_redirect_url).strip()
+
+        if st.button("🚀 使用 Google 帳號登入", type="primary", use_container_width=True):
+            try:
+                res = st.session_state.auth_client.auth.sign_in_with_oauth({
+                    "provider": "google",
+                    "options": {
+                        "redirect_to": redirect_url,
+                        "query_params": {
+                            "access_type": "offline",
+                            "prompt": "consent select_account",
+                        },
+                    },
+                })
+
+                oauth_url = getattr(res, "url", None)
+                st.write("OAuth URL（請複製/點連結）：")
+                st.code(str(oauth_url), language="text")
+                print("OAUTH_URL =", oauth_url)
+
+                if oauth_url:
+                    st.link_button("👉 開新分頁登入 Google", oauth_url)
+                else:
+                    st.error("❌ res.url 為空，無法取得登入連結。")
+
+                st.stop()
+
+            except Exception as e:
+                st.error(f"❌ 初始化失敗: {e}")
+                st.stop()
+
 
 
 # --- 執行登入檢查 ---
