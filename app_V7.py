@@ -127,7 +127,7 @@ def show_login_UI():
                     "provider": "google",
                     "options": {
                         "redirect_to": redirect_url,
-                        "queryParams": {"access_type": "offline", "prompt": "consent"}
+                        "queryParams": {"access_type": "offline", "prompt": "consent select_account"}
                     }
                 })
                 if res.url:
