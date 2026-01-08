@@ -1,8 +1,10 @@
 streamlit
-pandas
+pandas>=2.0.0
 yfinance
-plotly
+plotly==5.22.0
 supabase
 requests
 beautifulsoup4
 html5lib
+tenacity>=6.2.0
+packaging
