@@ -59,6 +59,7 @@ if 'auth_client' not in st.session_state:
         flow_type="pkce"
     )
 )
+
     except Exception as e:
         st.error(f"❌ Auth Client 初始化失敗: {e}")
         st.stop()
@@ -92,7 +93,13 @@ def handle_login():
     code = params.get("code")
     if isinstance(code, list): code = code[0]
 
-    if code:
+# 2. 處理網址回調 (Google 登入後帶回的 code)
+params = get_query_params()
+code = params.get("code")
+if isinstance(code, list):
+    code = code[0]
+
+if code:
     try:
         # ✅ 用 dict 交換 session（很重要）
         res = auth_client.auth.exchange_code_for_session({"auth_code": code})
@@ -118,6 +125,7 @@ def handle_login():
         st.error(f"❌ exchange_code_for_session 失敗：{e}")
         # 先不要 clear_url，保留 code 方便你看問題
         st.stop()
+
 
 def show_login_UI():
     col1, col2, col3 = st.columns([1, 2, 1])
