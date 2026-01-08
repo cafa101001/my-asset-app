@@ -3,7 +3,11 @@ import pandas as pd
 from datetime import datetime, timedelta
 import plotly.express as px
 import plotly.graph_objects as go
+from urllib.parse import urlparse, parse_qs
 import time
+# 用 state 當 key 暫存 PKCE code_verifier（避免 Streamlit redirect 後 session_state 遺失）
+OAUTH_PKCE_STORE = {}
+
 
 # --- 關鍵匯入 ---
 # 引入 utils 中的 update_supabase_session 來同步權限
@@ -52,13 +56,10 @@ if 'auth_client' not in st.session_state:
         key = st.secrets["SUPABASE_KEY"]
         # 關鍵：使用自訂 storage
         st.session_state.auth_client = create_client(
-    url,
-    key,
-    options=ClientOptions(
-        storage=StreamlitSessionStorage(),
-        flow_type="pkce"
-    )
+    url, key,
+    options=ClientOptions(storage=StreamlitSessionStorage(), flow_type="pkce")
 )
+
 
     except Exception as e:
         st.error(f"❌ Auth Client 初始化失敗: {e}")
@@ -72,6 +73,22 @@ def clear_url():
     try: st.query_params.clear()
     except: st.experimental_set_query_params()
 
+
+from urllib.parse import urlparse, parse_qs
+import json
+import streamlit.components.v1 as components
+import time
+
+# 用 state 當 key 暫存 PKCE verifier（避免 Streamlit OAuth 跳轉後 session_state 遺失）
+OAUTH_PKCE_STORE = {}
+
+def _first(v):
+    """把 query param 的值統一成單一字串"""
+    if v is None:
+        return None
+    if isinstance(v, list):
+        return v[0] if v else None
+    return v
 
 def handle_login():
     """處理登入流程與同步（Supabase OAuth code -> session）"""
@@ -92,14 +109,22 @@ def handle_login():
     except Exception:
         pass
 
-    # 2) 處理 OAuth 回調：URL query 內的 code
+    # 2) 處理 OAuth 回調：URL query 內的 code/state
     params = get_query_params()
-    code = params.get("code")
-    if isinstance(code, list):
-        code = code[0]
+    code = _first(params.get("code"))
+    state = _first(params.get("state"))
 
     if code:
         try:
+            # ✅ (重要) 若有 state，就把對應的 code_verifier 放回 supabase_auth_storage
+            if state and state in OAUTH_PKCE_STORE:
+                info = OAUTH_PKCE_STORE.pop(state, None)
+                if info:
+                    if "supabase_auth_storage" not in st.session_state:
+                        st.session_state.supabase_auth_storage = {}
+                    st.session_state.supabase_auth_storage[info["key"]] = info["verifier"]
+
+            # ✅ 重要：Python 版用 dict 參數，不要傳純字串
             res = auth_client.auth.exchange_code_for_session({"auth_code": code})
 
             session = getattr(res, "session", None)
@@ -121,7 +146,7 @@ def handle_login():
             st.error(f"❌ exchange_code_for_session 失敗：{e}")
             st.write("Query params:", params)
             st.stop()
-            
+
 def show_login_UI():
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
@@ -144,28 +169,68 @@ def show_login_UI():
                         "redirect_to": redirect_url,
                         "query_params": {
                             "access_type": "offline",
-                            "prompt": "consent select_account",
-                        },
-                    },
+                            "prompt": "consent select_account"
+                        }
+                    }
                 })
 
                 oauth_url = getattr(res, "url", None)
-                st.write("OAuth URL（請複製/點連結）：")
-                st.code(str(oauth_url), language="text")
-                print("OAUTH_URL =", oauth_url)
+                if not oauth_url:
+                    st.error("❌ 無法取得 OAuth URL（res.url 為空）")
+                    st.stop()
 
-                if oauth_url:
-                    st.link_button("👉 開新分頁登入 Google", oauth_url)
-                else:
-                    st.error("❌ res.url 為空，無法取得登入連結。")
+                # --- ✅ 把 PKCE verifier 用 state 暫存起來（跨 session 也能找回） ---
+                parsed = urlparse(oauth_url)
+                qs = parse_qs(parsed.query)
+                state = qs.get("state", [None])[0]
 
+                storage = st.session_state.get("supabase_auth_storage", {})
+                verifier_key = None
+                for k in storage.keys():
+                    lk = str(k).lower()
+                    if "code-verifier" in lk or "code_verifier" in lk:
+                        verifier_key = k
+                        break
+
+                if not state:
+                    st.error("❌ OAuth URL 裡沒有 state，無法暫存 PKCE verifier")
+                    st.code(oauth_url)
+                    st.stop()
+
+                if not verifier_key or not storage.get(verifier_key):
+                    st.error("❌ 找不到 code_verifier（storage 裡沒有 verifier）")
+                    st.write("storage keys:", list(storage.keys()))
+                    st.stop()
+
+                OAUTH_PKCE_STORE[state] = {
+                    "key": verifier_key,
+                    "verifier": storage.get(verifier_key),
+                    "ts": time.time(),
+                }
+
+                # 清理太舊的暫存（10 分鐘）
+                now = time.time()
+                for s, info in list(OAUTH_PKCE_STORE.items()):
+                    if now - info.get("ts", 0) > 600:
+                        OAUTH_PKCE_STORE.pop(s, None)
+
+                # ✅ 同分頁自動跳轉（降低 verifier 遺失機率）
+                components.html(
+                    f"""
+                    <script>
+                      window.location.href = {json.dumps(oauth_url)};
+                    </script>
+                    """,
+                    height=0,
+                )
+
+                # 保底：若瀏覽器擋 script，仍提供可點連結
+                st.markdown(f"[👉 若未自動跳轉，請點此登入 Google]({oauth_url})")
                 st.stop()
 
             except Exception as e:
                 st.error(f"❌ 初始化失敗: {e}")
                 st.stop()
-
-
 
 # --- 執行登入檢查 ---
 handle_login()
@@ -173,6 +238,7 @@ handle_login()
 if not st.session_state.user:
     show_login_UI()
     st.stop()
+
 
 
 # ==========================================
