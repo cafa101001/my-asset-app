@@ -72,10 +72,10 @@ def clear_url():
     try: st.query_params.clear()
     except: st.experimental_set_query_params()
 
+
 def handle_login():
     """處理登入流程與同步（Supabase OAuth code -> session）"""
 
-    # ✅ 確保 auth_client 存在（避免 name not defined）
     auth_client = st.session_state.get("auth_client")
     if auth_client is None:
         st.error("❌ auth_client 尚未初始化（st.session_state.auth_client 不存在）")
@@ -100,7 +100,6 @@ def handle_login():
 
     if code:
         try:
-            # ✅ 重要：Python 版用 dict 參數，不要傳純字串
             res = auth_client.auth.exchange_code_for_session({"auth_code": code})
 
             session = getattr(res, "session", None)
@@ -109,10 +108,8 @@ def handle_login():
             if user and session:
                 st.session_state.user = user
                 st.session_state.user_id = user.id
-
                 update_supabase_session(session.access_token, session.refresh_token)
 
-                st.success(f"✅ 歡迎回來，{user.email}！")
                 clear_url()
                 st.rerun()
             else:
@@ -121,92 +118,9 @@ def handle_login():
                 st.stop()
 
         except Exception as e:
-            # ✅ 不要再靜默 clear_url + rerun，先把錯誤顯示出來才好修
             st.error(f"❌ exchange_code_for_session 失敗：{e}")
             st.write("Query params:", params)
             st.stop()
-
-
-# 2. 處理網址回調 (Google 登入後帶回的 code)
-params = get_query_params()
-code = params.get("code")
-if isinstance(code, list):
-    code = code[0]
-
-if code:
-    try:
-        # ✅ 用 dict 交換 session（很重要）
-        res = auth_client.auth.exchange_code_for_session({"auth_code": code})
-
-        session = getattr(res, "session", None)
-        user = getattr(res, "user", None)
-
-        if user and session:
-            st.session_state.user = user
-            st.session_state.user_id = user.id
-
-            # 同步你的 data_client 權限
-            update_supabase_session(session.access_token, session.refresh_token)
-
-            st.success(f"✅ 歡迎回來，{user.email}！")
-            clear_url()
-            st.rerun()
-        else:
-            st.error("❌ 交換 session 失敗：res.user 或 res.session 為空")
-            st.write(res)
-
-    except Exception as e:
-        st.error(f"❌ exchange_code_for_session 失敗：{e}")
-        # 先不要 clear_url，保留 code 方便你看問題
-        st.stop()
-
-
-def show_login_UI():
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        st.title("🔐 全球資產管理系統 V7.5")
-        st.markdown("### 請登入以存取您的個人資產數據")
-
-        # 預設使用 secrets 的雲端網址，否則退回 localhost（僅本機測試用）
-        try:
-            default_redirect_url = st.secrets["REDIRECT_URL"]
-        except Exception:
-            default_redirect_url = "http://localhost:8501"
-
-        with st.expander("⚙️ 設定登入回調網址 (若無法登入請檢查)", expanded=False):
-            redirect_url = st.text_input("Redirect URL", value=default_redirect_url).strip()
-
-        if st.button("🚀 使用 Google 帳號登入", type="primary", use_container_width=True):
-            try:
-                res = st.session_state.auth_client.auth.sign_in_with_oauth({
-                    "provider": "google",
-                    "options": {
-                        "redirect_to": redirect_url,
-                        # ✅ Python 要用 query_params（不是 queryParams）
-                        "query_params": {
-                            "access_type": "offline",
-                            "prompt": "consent select_account"
-                        }
-                    }
-                })
-
-                oauth_url = getattr(res, "url", None)
-
-                # --- 一定要印出來（畫面 + logs）---
-                st.write("OAuth URL（請複製/點連結）：")
-                st.code(str(oauth_url), language="text")
-                print("OAUTH_URL =", oauth_url)  # ✅ 到 Streamlit Cloud: Manage app -> Logs 看
-
-                if oauth_url:
-                    st.link_button("👉 開新分頁登入 Google", oauth_url)
-                else:
-                    st.error("❌ res.url 為空，沒有拿到 OAuth 連結（請檢查 Supabase/Provider 設定）。")
-
-                st.stop()
-
-            except Exception as e:
-                st.error(f"❌ 初始化失敗: {e}")
-
 
 
 # --- 執行登入檢查 ---
@@ -215,6 +129,7 @@ handle_login()
 if not st.session_state.user:
     show_login_UI()
     st.stop()
+
 
 # ==========================================
 #      🚀 主程式邏輯 (登入成功後)
