@@ -1,8 +1,8 @@
 streamlit
-pandas>=2.0.0
-yfinance>=0.2.0
-plotly>=5.18.0
+pandas
+yfinance
+plotly
 supabase
 requests
-lxml
 beautifulsoup4
+html5lib
