@@ -51,7 +51,14 @@ if 'auth_client' not in st.session_state:
         url = st.secrets["SUPABASE_URL"]
         key = st.secrets["SUPABASE_KEY"]
         # 關鍵：使用自訂 storage
-        st.session_state.auth_client = create_client(url, key, options=ClientOptions(storage=StreamlitSessionStorage()))
+        st.session_state.auth_client = create_client(
+    url,
+    key,
+    options=ClientOptions(
+        storage=StreamlitSessionStorage(),
+        flow_type="pkce"
+    )
+)
     except Exception as e:
         st.error(f"❌ Auth Client 初始化失敗: {e}")
         st.stop()
@@ -86,25 +93,31 @@ def handle_login():
     if isinstance(code, list): code = code[0]
 
     if code:
-        try:
-            # 交換 Session
-            res = auth_client.auth.exchange_code_for_session(code)
-            if res.user:
-                st.session_state.user = res.user
-                st.session_state.user_id = res.user.id
-                
-                # *** 關鍵修正：同步權限 ***
-                update_supabase_session(res.session.access_token, res.session.refresh_token)
-                
-                st.success(f"✅ 歡迎回來，{res.user.email}！")
-                time.sleep(0.5)
-                clear_url()
-                st.rerun()
-        except Exception as e:
-            # 靜默處理錯誤並重試 (通常是因為 code 重複使用)
-            # 清除網址讓使用者回到乾淨狀態
+    try:
+        # ✅ 用 dict 交換 session（很重要）
+        res = auth_client.auth.exchange_code_for_session({"auth_code": code})
+
+        session = getattr(res, "session", None)
+        user = getattr(res, "user", None)
+
+        if user and session:
+            st.session_state.user = user
+            st.session_state.user_id = user.id
+
+            # 同步你的 data_client 權限
+            update_supabase_session(session.access_token, session.refresh_token)
+
+            st.success(f"✅ 歡迎回來，{user.email}！")
             clear_url()
             st.rerun()
+        else:
+            st.error("❌ 交換 session 失敗：res.user 或 res.session 為空")
+            st.write(res)
+
+    except Exception as e:
+        st.error(f"❌ exchange_code_for_session 失敗：{e}")
+        # 先不要 clear_url，保留 code 方便你看問題
+        st.stop()
 
 def show_login_UI():
     col1, col2, col3 = st.columns([1, 2, 1])
