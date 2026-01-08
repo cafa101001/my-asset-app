@@ -111,29 +111,48 @@ def show_login_UI():
     with col2:
         st.title("🔐 全球資產管理系統 V7.5")
         st.markdown("### 請登入以存取您的個人資產數據")
-        
-        # 預設埠號設為 8501，但允許手動修改
+
+        # 預設使用 secrets 的雲端網址，否則退回 localhost（僅本機測試用）
         try:
-            redirect_url = st.secrets["REDIRECT_URL"]
-        except:
-            redirect_url = "http://localhost:8501" 
-            
+            default_redirect_url = st.secrets["REDIRECT_URL"]
+        except Exception:
+            default_redirect_url = "http://localhost:8501"
+
         with st.expander("⚙️ 設定登入回調網址 (若無法登入請檢查)", expanded=False):
-            redirect_url = st.text_input("Redirect URL", value=redirect_url)
-        
+            redirect_url = st.text_input("Redirect URL", value=default_redirect_url).strip()
+
         if st.button("🚀 使用 Google 帳號登入", type="primary", use_container_width=True):
             try:
                 res = st.session_state.auth_client.auth.sign_in_with_oauth({
                     "provider": "google",
                     "options": {
                         "redirect_to": redirect_url,
-                        "queryParams": {"access_type": "offline", "prompt": "consent select_account"}
+                        # ✅ Python 要用 query_params（不是 queryParams）
+                        "query_params": {
+                            "access_type": "offline",
+                            "prompt": "consent select_account"
+                        }
                     }
                 })
-                if res.url:
-                    st.markdown(f'<meta http-equiv="refresh" content="0;url={res.url}">', unsafe_allow_html=True)
+
+                oauth_url = getattr(res, "url", None)
+
+                # --- 一定要印出來（畫面 + logs）---
+                st.write("OAuth URL（請複製/點連結）：")
+                st.code(str(oauth_url), language="text")
+                print("OAUTH_URL =", oauth_url)  # ✅ 到 Streamlit Cloud: Manage app -> Logs 看
+
+                if oauth_url:
+                    st.link_button("👉 開新分頁登入 Google", oauth_url)
+                else:
+                    st.error("❌ res.url 為空，沒有拿到 OAuth 連結（請檢查 Supabase/Provider 設定）。")
+
+                st.stop()
+
             except Exception as e:
                 st.error(f"❌ 初始化失敗: {e}")
+
+
 
 # --- 執行登入檢查 ---
 handle_login()
