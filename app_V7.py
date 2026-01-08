@@ -73,25 +73,59 @@ def clear_url():
     except: st.experimental_set_query_params()
 
 def handle_login():
-    """處理登入流程與同步"""
-    auth_client = st.session_state.auth_client
+    """處理登入流程與同步（Supabase OAuth code -> session）"""
 
-    # 1. 嘗試從 Storage 恢復 Session
+    # ✅ 確保 auth_client 存在（避免 name not defined）
+    auth_client = st.session_state.get("auth_client")
+    if auth_client is None:
+        st.error("❌ auth_client 尚未初始化（st.session_state.auth_client 不存在）")
+        st.stop()
+
+    # 1) 嘗試從既有 session 恢復
     try:
         session = auth_client.auth.get_session()
-        if session and session.user:
+        if session and getattr(session, "user", None):
             st.session_state.user = session.user
             st.session_state.user_id = session.user.id
-            # *** 關鍵修正：呼叫 utils.py 的函式更新全域權限 ***
             update_supabase_session(session.access_token, session.refresh_token)
             return
     except Exception:
         pass
 
-    # 2. 處理網址回調 (Google 登入後帶回的 code)
+    # 2) 處理 OAuth 回調：URL query 內的 code
     params = get_query_params()
     code = params.get("code")
-    if isinstance(code, list): code = code[0]
+    if isinstance(code, list):
+        code = code[0]
+
+    if code:
+        try:
+            # ✅ 重要：Python 版用 dict 參數，不要傳純字串
+            res = auth_client.auth.exchange_code_for_session({"auth_code": code})
+
+            session = getattr(res, "session", None)
+            user = getattr(res, "user", None)
+
+            if user and session:
+                st.session_state.user = user
+                st.session_state.user_id = user.id
+
+                update_supabase_session(session.access_token, session.refresh_token)
+
+                st.success(f"✅ 歡迎回來，{user.email}！")
+                clear_url()
+                st.rerun()
+            else:
+                st.error("❌ 交換 session 失敗：res.user 或 res.session 為空")
+                st.write(res)
+                st.stop()
+
+        except Exception as e:
+            # ✅ 不要再靜默 clear_url + rerun，先把錯誤顯示出來才好修
+            st.error(f"❌ exchange_code_for_session 失敗：{e}")
+            st.write("Query params:", params)
+            st.stop()
+
 
 # 2. 處理網址回調 (Google 登入後帶回的 code)
 params = get_query_params()
