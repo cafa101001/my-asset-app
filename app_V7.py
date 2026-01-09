@@ -33,100 +33,164 @@ from logic import fetch_all_data, calculate_detailed_metrics, clean_df, save_dai
 
 # --- 1. 頁面基礎設定 ---
 st.set_page_config(page_title="全球資產管理系統 V7.5", layout="wide")
+
 # ==========================================
 #      🇹🇼 台股代碼 -> 中文名稱（快取）
 # ==========================================
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_twse_stock_map():
-    """從證交所抓取台股代碼與中文名稱對照表（快取 1 天）
 
-    重要修正：
-    - 不再把失敗結果（空 dict）快取，避免第一次抓取失敗後卡一天。
-    - 解析時保留前導 0（例如 006208）。
-    - 以 BeautifulSoup 解析表格，避免 pd.read_html 在雲端環境偶發抓不到表格。
-    """
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0 Safari/537.36"
-        )
-    }
+def _norm_twse_text(s: str) -> str:
+    s = str(s).replace("\u3000", " ").replace("　", " ").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
-    # strMode=2：上市/ETF；strMode=4：上櫃（多抓一個模式，覆蓋更完整）
-    modes = [2, 4]
-    out: dict[str, str] = {}
+def _parse_isin_table(html: str) -> dict:
+    """解析 TWSE ISIN 清單頁：取出『代號 -> 中文名稱』"""
+    mp: dict = {}
+    soup = BeautifulSoup(html, "html.parser")
 
-    for m in modes:
-        url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={m}"
-        res = requests.get(url, headers=headers, timeout=30)
-        res.raise_for_status()
+    tables = soup.find_all("table")
+    if not tables:
+        return mp
 
-        # 自動判斷編碼（TWSE 常見 big5/cp950）
-        res.encoding = res.apparent_encoding or res.encoding or "cp950"
-        html = res.text
+    # 優先找含「有價證券代號及名稱」字樣的表格
+    target = None
+    for tbl in tables:
+        if "有價證券代號及名稱" in tbl.get_text():
+            target = tbl
+            break
 
-        soup = BeautifulSoup(html, "html.parser")
-        tables = soup.find_all("table")
-        target = None
-        for t in tables:
-            if "有價證券代號及名稱" in t.get_text():
-                target = t
-                break
-        if target is None:
+    # 找不到就取 tr 最多的那張表（保底）
+    if target is None:
+        target = max(tables, key=lambda t: len(t.find_all("tr")))
+
+    for tr in target.find_all("tr"):
+        tds = tr.find_all("td")
+        if not tds:
             continue
 
-        for tr in target.find_all("tr"):
-            tds = tr.find_all("td")
-            if not tds:
-                continue
+        cells = [_norm_twse_text(td.get_text(" ", strip=True)) for td in tds]
+        if not cells:
+            continue
 
-            cell = tds[0].get_text(" ", strip=True)
-            if not cell:
-                continue
+        first = cells[0]
+        if not first:
+            continue
+        if "有價證券代號及名稱" in first:
+            continue
 
-            # 正規化空白（包含全形空白與 NBSP）
-            cell = cell.replace("\u3000", " ").replace("\xa0", " ").strip()
-            cell = re.sub(r"[\s\u3000]+", " ", cell).strip()
+        code = None
+        name = None
 
-            if (not cell) or ("有價證券代號及名稱" in cell):
-                continue
+        # Case 1：第一欄就是「2330 台積電」這種格式
+        m = re.match(r"^([0-9A-Za-z]{4,8})\s+(.+)$", first)
+        if m:
+            c = m.group(1).strip().upper()
+            n = m.group(2).strip()
+            if any(ch.isdigit() for ch in c) and n:
+                code, name = c, n
 
-            # 格式通常為：006208 富邦台50
-            m2 = re.match(r"^([0-9A-Z]{4,10})\s+(.+)$", cell)
-            if not m2:
-                continue
+        # Case 2：欄位分開（第一欄是代碼、第二欄是名稱）
+        if code is None and re.fullmatch(r"[0-9A-Za-z]{4,8}", first) and len(cells) >= 2:
+            c = first.strip().upper()
+            n = cells[1].strip()
+            if any(ch.isdigit() for ch in c) and n:
+                code, name = c, n
 
-            code = m2.group(1).strip().upper()
-            name = m2.group(2).strip()
+        if not code or not name:
+            continue
 
-            # 排除分類列（例如「股票」「ETF」等）
-            if (not code) or (not code[0].isdigit()):
-                continue
+        mp[code] = name
+        if code.isdigit():
+            mp[f"{code}.TW"] = name
 
-            out[code] = name
-            out[f"{code}.TW"] = name
+    return mp
 
-    # 若完全抓不到，丟出例外（讓 cache 不會記住空結果，下一次可再試）
-    if not out:
-        raise RuntimeError("台股代碼對照表抓取/解析失敗（結果為空）")
+@st.cache_data(ttl=86400, show_spinner=False)
+def _load_twse_stock_map(_cache_bust: str = "v3") -> dict:
+    """抓取上市/上櫃清單並合併（成功才會被 cache；失敗會丟例外避免 cache 空結果）"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+    }
 
-    return out
+    mp: dict = {}
 
+    # strMode=2：上市、ETF 等；strMode=4：上櫃
+    for mode in ("2", "4"):
+        url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}"
+        r = requests.get(url, headers=headers, timeout=30)
+        # ISIN 清單頁多為 Big5；避免 requests 誤判成 ISO-8859-1
+        if (not r.encoding) or (r.encoding.lower() == "iso-8859-1"):
+            r.encoding = "big5"
+        mp.update(_parse_isin_table(r.text))
+
+    # 防呆：如果太小，代表抓取/解析失敗，不要 cache
+    if len(mp) < 500:
+        raise RuntimeError(f"TWSE mapping too small: {len(mp)}")
+
+    return mp
+
+def get_twse_stock_map() -> dict:
+    """回傳台股代碼->中文名稱對照表（快取 1 天）。"""
+    try:
+        # 透過 cache_bust 版本字串確保部署更新後會重新抓取
+        return _load_twse_stock_map(_cache_bust="v3_2026-01-09")
+    except Exception as e:
+        # 不要 st.error 以免打斷流程，改用 log
+        print(f"TWSE 清單抓取/解析失敗: {e}")
+        return {}
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _twse_code_query(code: str) -> str:
+    """若全量清單抓不到，用 TWSE codeQuery 以代碼查名稱（結果會 cache）。"""
+    code = str(code).strip().upper().replace(".TW", "").replace(".TWO", "")
+    if not code:
+        return ""
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+    }
+    url = f"https://www.twse.com.tw/zh/api/codeQuery?query={code}"
+    r = requests.get(url, headers=headers, timeout=10)
+    if r.status_code != 200:
+        return ""
+    try:
+        j = r.json()
+    except Exception:
+        return ""
+
+    sugs = j.get("suggestions") or []
+    for s in sugs:
+        s = str(s)
+        parts = s.split("\t")
+        if parts and parts[0].strip() == code:
+            if len(parts) > 1 and parts[1].strip():
+                return parts[1].strip()
+
+    # fallback：有些格式可能是「2330 台積電」
+    for s in sugs:
+        ss = _norm_twse_text(s)
+        if ss.startswith(code + " "):
+            return ss[len(code) + 1 :].strip()
+
+    return ""
 
 def get_tw_stock_name(code: str):
-    """回傳台股中文名稱；查不到或對照表載入失敗則回傳 None"""
-    base = str(code).strip().upper()
-    if base.endswith(".TW"):
-        base = base[:-3]
-
-    try:
-        mp = get_twse_stock_map()
-    except Exception as e:
-        print(f"TWSE 名稱對照表載入失敗: {e}")
+    """回傳台股中文名稱；查不到則回傳 None"""
+    base = str(code).strip().upper().replace(".TW", "").replace(".TWO", "")
+    if not base:
         return None
 
-    return mp.get(base)
+    mp = get_twse_stock_map()
+    if mp:
+        name = mp.get(base) or mp.get(f"{base}.TW")
+        if name:
+            return name
+
+    # 全量清單抓不到時的保底查詢（單筆查詢也會 cache）
+    qname = _twse_code_query(base)
+    return qname if qname else None
 
 
 def _format_dt_series(s: pd.Series) -> pd.Series:
@@ -693,25 +757,15 @@ if not st.session_state.transactions.empty:
     
     if not holdings_df.empty:
         # ✅ 台股代碼 -> 中文名稱（第一次會抓取全量清單並快取）
-        try:
-            tw_map = get_twse_stock_map()
-        except Exception as e:
-            tw_map = {}
-            print(f"TWSE 名稱對照表載入失敗: {e}")
-
-        # 保險：若 calculate_detailed_metrics 沒產生『顯示名稱』欄位，這裡補上
-        if "顯示名稱" not in holdings_df.columns:
-            holdings_df["顯示名稱"] = holdings_df["代碼"]
-
-        if tw_map:
-            mask_tw = holdings_df["類別"] == "台股"
-            if mask_tw.any():
-                def _tw_disp(code):
-                    base = str(code).upper().replace(".TW", "").strip()
-                    name = tw_map.get(base) or tw_map.get(f"{base}.TW")
-                    return f"{name} ({base})" if name else base
-
-                holdings_df.loc[mask_tw, "顯示名稱"] = holdings_df.loc[mask_tw, "代碼"].apply(_tw_disp)
+        if '顯示名稱' not in holdings_df.columns:
+            holdings_df['顯示名稱'] = holdings_df['代碼']
+        mask_tw = holdings_df['類別'] == '台股'
+        if mask_tw.any():
+            def _tw_disp(code):
+                base = str(code).upper().replace('.TW', '').strip()
+                name = get_tw_stock_name(base)
+                return f"{name}({base})" if name else base
+            holdings_df.loc[mask_tw, '顯示名稱'] = holdings_df.loc[mask_tw, '代碼'].apply(_tw_disp)
 
         holdings_df['現價'] = holdings_df['代碼'].map(prices).fillna(0)
         holdings_df['匯率'] = holdings_df['類別'].apply(lambda x: current_ex_rate if x != '台股' else 1.0)
@@ -1111,13 +1165,12 @@ else:
     # 台股代碼 -> 中文名稱（顯示用，不回寫）
     tx_src["台股名稱"] = ""
     try:
-        tw_map = get_twse_stock_map()
-        if tw_map and "類別" in tx_src.columns and "代碼" in tx_src.columns:
+        if "類別" in tx_src.columns and "代碼" in tx_src.columns:
             mask = tx_src["類別"] == "台股"
             if mask.any():
                 def _tw_name_only(code):
                     base = str(code).upper().replace(".TW", "").strip()
-                    return tw_map.get(base, "")
+                    return get_tw_stock_name(base) or ""
                 tx_src.loc[mask, "台股名稱"] = tx_src.loc[mask, "代碼"].apply(_tw_name_only)
     except Exception:
         pass
