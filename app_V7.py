@@ -38,6 +38,29 @@ st.set_page_config(page_title="全球資產管理系統 V7.5", layout="wide")
 #      🇹🇼 台股代碼 -> 中文名稱（快取）
 # ==========================================
 
+def _safe_get(url: str, headers=None, timeout: int = 10):
+    """安全抓取（避免 Streamlit Cloud 偶發 SSL 憑證問題導致整個 APP 掛掉）
+
+    先使用 certifi 的 CA bundle；若仍遇到 SSLError，再退回 verify=False（僅用於抓公開資料）。
+    """
+    try:
+        import certifi  # type: ignore
+        verify = certifi.where()
+    except Exception:
+        verify = True
+
+    try:
+        return requests.get(url, headers=headers, timeout=timeout, verify=verify)
+    except requests.exceptions.SSLError as e:
+        # 部分環境可能缺少完整根憑證：退回不驗證憑證（公開資料抓取）
+        try:
+            import urllib3  # type: ignore
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        except Exception:
+            pass
+        return requests.get(url, headers=headers, timeout=timeout, verify=False)
+
+
 def _norm_twse_text(s: str) -> str:
     s = str(s).replace("\u3000", " ").replace("　", " ").strip()
     s = re.sub(r"\s+", " ", s)
@@ -118,7 +141,7 @@ def _load_twse_stock_map(_cache_bust: str = "v3") -> dict:
     # strMode=2：上市、ETF 等；strMode=4：上櫃
     for mode in ("2", "4"):
         url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}"
-        r = requests.get(url, headers=headers, timeout=30)
+        r = _safe_get(url, headers=headers, timeout=30)
         # ISIN 清單頁多為 Big5；避免 requests 誤判成 ISO-8859-1
         if (not r.encoding) or (r.encoding.lower() == "iso-8859-1"):
             r.encoding = "big5"
@@ -152,7 +175,7 @@ def _twse_code_query(code: str) -> str:
         "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
     }
     url = f"https://www.twse.com.tw/zh/api/codeQuery?query={code}"
-    r = requests.get(url, headers=headers, timeout=10)
+    r = _safe_get(url, headers=headers, timeout=10)
     if r.status_code != 200:
         return ""
     try:
@@ -189,7 +212,11 @@ def get_tw_stock_name(code: str):
             return name
 
     # 全量清單抓不到時的保底查詢（單筆查詢也會 cache）
-    qname = _twse_code_query(base)
+    try:
+        qname = _twse_code_query(base)
+    except Exception as e:
+        print(f"TWSE codeQuery 失敗 ({base}): {e}")
+        qname = ""
     return qname if qname else None
 
 
