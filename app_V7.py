@@ -9,6 +9,8 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import json
 import streamlit.components.v1 as components
 import requests
+import re
+from bs4 import BeautifulSoup
 
 # --- 關鍵匯入 ---
 # 引入 utils 中的 update_supabase_session 來同步權限
@@ -34,48 +36,98 @@ st.set_page_config(page_title="全球資產管理系統 V7.5", layout="wide")
 # ==========================================
 #      🇹🇼 台股代碼 -> 中文名稱（快取）
 # ==========================================
-@st.cache_resource(ttl=86400)
+@st.cache_data(ttl=86400, show_spinner=False)
 def get_twse_stock_map():
-    """從證交所抓取台股代碼與中文名稱對照表（快取 1 天）"""
+    """從證交所抓取台股代碼與中文名稱對照表（快取 1 天）
+
+    重要修正：
+    - 不再把失敗結果（空 dict）快取，避免第一次抓取失敗後卡一天。
+    - 解析時保留前導 0（例如 006208）。
+    - 以 BeautifulSoup 解析表格，避免 pd.read_html 在雲端環境偶發抓不到表格。
+    """
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36"
+        )
     }
-    url = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
-    mp = {}
-    try:
-        res = requests.get(url, headers=headers, timeout=20)
-        # 證交所頁面常見 cp950/big5 編碼
-        res.encoding = "cp950"
-        # 使用 html5lib（requirements 已包含 html5lib），避免 lxml 依賴
-        dfs = pd.read_html(res.text, flavor="html5lib")
-        if not dfs:
-            return mp
-        df = dfs[0]
-        col0 = df.columns[0]
-        for raw in df[col0].dropna():
-            s = str(raw).replace("　", " ").strip()
-            if not s or "有價證券代號及名稱" in s:
+
+    # strMode=2：上市/ETF；strMode=4：上櫃（多抓一個模式，覆蓋更完整）
+    modes = [2, 4]
+    out: dict[str, str] = {}
+
+    for m in modes:
+        url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={m}"
+        res = requests.get(url, headers=headers, timeout=30)
+        res.raise_for_status()
+
+        # 自動判斷編碼（TWSE 常見 big5/cp950）
+        res.encoding = res.apparent_encoding or res.encoding or "cp950"
+        html = res.text
+
+        soup = BeautifulSoup(html, "html.parser")
+        tables = soup.find_all("table")
+        target = None
+        for t in tables:
+            if "有價證券代號及名稱" in t.get_text():
+                target = t
+                break
+        if target is None:
+            continue
+
+        for tr in target.find_all("tr"):
+            tds = tr.find_all("td")
+            if not tds:
                 continue
-            if " " not in s:
+
+            cell = tds[0].get_text(" ", strip=True)
+            if not cell:
                 continue
-            code, name = s.split(" ", 1)
-            code = code.strip().upper()
-            name = name.strip()
+
+            # 正規化空白（包含全形空白與 NBSP）
+            cell = cell.replace("\u3000", " ").replace("\xa0", " ").strip()
+            cell = re.sub(r"[\s\u3000]+", " ", cell).strip()
+
+            if (not cell) or ("有價證券代號及名稱" in cell):
+                continue
+
+            # 格式通常為：006208 富邦台50
+            m2 = re.match(r"^([0-9A-Z]{4,10})\s+(.+)$", cell)
+            if not m2:
+                continue
+
+            code = m2.group(1).strip().upper()
+            name = m2.group(2).strip()
+
             # 排除分類列（例如「股票」「ETF」等）
-            if not code or not any(ch.isdigit() for ch in code):
+            if (not code) or (not code[0].isdigit()):
                 continue
-            mp[code] = name
-            mp[f"{code}.TW"] = name
-    except Exception as e:
-        # 不要在這裡 st.error，避免打斷主流程
-        print(f"TWSE 清單抓取失敗: {e}")
-    return mp
+
+            out[code] = name
+            out[f"{code}.TW"] = name
+
+    # 若完全抓不到，丟出例外（讓 cache 不會記住空結果，下一次可再試）
+    if not out:
+        raise RuntimeError("台股代碼對照表抓取/解析失敗（結果為空）")
+
+    return out
+
 
 def get_tw_stock_name(code: str):
-    """回傳台股中文名稱；查不到則回傳 None"""
-    base = str(code).strip().upper().replace(".TW", "")
-    mp = get_twse_stock_map()
+    """回傳台股中文名稱；查不到或對照表載入失敗則回傳 None"""
+    base = str(code).strip().upper()
+    if base.endswith(".TW"):
+        base = base[:-3]
+
+    try:
+        mp = get_twse_stock_map()
+    except Exception as e:
+        print(f"TWSE 名稱對照表載入失敗: {e}")
+        return None
+
     return mp.get(base)
+
 
 def _format_dt_series(s: pd.Series) -> pd.Series:
     """把時間欄位格式化為 YYYY-MM-DD HH:MM（支援 timezone-aware / naive）"""
@@ -641,15 +693,25 @@ if not st.session_state.transactions.empty:
     
     if not holdings_df.empty:
         # ✅ 台股代碼 -> 中文名稱（第一次會抓取全量清單並快取）
-        tw_map = get_twse_stock_map()
+        try:
+            tw_map = get_twse_stock_map()
+        except Exception as e:
+            tw_map = {}
+            print(f"TWSE 名稱對照表載入失敗: {e}")
+
+        # 保險：若 calculate_detailed_metrics 沒產生『顯示名稱』欄位，這裡補上
+        if "顯示名稱" not in holdings_df.columns:
+            holdings_df["顯示名稱"] = holdings_df["代碼"]
+
         if tw_map:
-            mask_tw = holdings_df['類別'] == '台股'
+            mask_tw = holdings_df["類別"] == "台股"
             if mask_tw.any():
                 def _tw_disp(code):
-                    base = str(code).upper().replace('.TW', '').strip()
-                    name = tw_map.get(base)
+                    base = str(code).upper().replace(".TW", "").strip()
+                    name = tw_map.get(base) or tw_map.get(f"{base}.TW")
                     return f"{name} ({base})" if name else base
-                holdings_df.loc[mask_tw, '顯示名稱'] = holdings_df.loc[mask_tw, '代碼'].apply(_tw_disp)
+
+                holdings_df.loc[mask_tw, "顯示名稱"] = holdings_df.loc[mask_tw, "代碼"].apply(_tw_disp)
 
         holdings_df['現價'] = holdings_df['代碼'].map(prices).fillna(0)
         holdings_df['匯率'] = holdings_df['類別'].apply(lambda x: current_ex_rate if x != '台股' else 1.0)
