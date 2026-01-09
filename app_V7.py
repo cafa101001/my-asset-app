@@ -1,13 +1,13 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
+
 import plotly.express as px
 import plotly.graph_objects as go
-from urllib.parse import urlparse, parse_qs
-import time
-# 用 state 當 key 暫存 PKCE code_verifier（避免 Streamlit redirect 後 session_state 遺失）
-OAUTH_PKCE_STORE = {}
 
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+import json
+import streamlit.components.v1 as components
 
 # --- 關鍵匯入 ---
 # 引入 utils 中的 update_supabase_session 來同步權限
@@ -15,9 +15,15 @@ from utils import supabase as data_client, get_market_data, update_supabase_sess
 
 # 嘗試匯入 Supabase Client 設定，若版本過舊則提示
 try:
-    from supabase import create_client, ClientOptions
-except ImportError:
-    st.error("❌ 偵測到 Supabase 套件版本過舊。請在終端機執行: `pip install supabase --upgrade` 更新套件。")
+    from supabase import create_client
+    try:
+        # 部分版本直接提供 ClientOptions
+        from supabase import ClientOptions  # type: ignore
+    except Exception:
+        # 新版常見路徑
+        from supabase.lib.client_options import ClientOptions  # type: ignore
+except Exception:
+    st.error("❌ 偵測到 Supabase 套件版本過舊或未安裝。請確認 requirements.txt 內有 `supabase`，並重新部署。")
     st.stop()
 
 from logic import fetch_all_data, calculate_detailed_metrics, clean_df, save_daily_snapshot
@@ -30,57 +36,67 @@ st.set_page_config(page_title="全球資產管理系統 V7.5", layout="wide")
 # ==========================================
 
 # 1. 初始化 Session State
-if 'user' not in st.session_state:
+if "user" not in st.session_state:
     st.session_state.user = None
-if 'user_id' not in st.session_state:
+if "user_id" not in st.session_state:
     st.session_state.user_id = None
 
-# 定義自訂儲存類別 (確保 Verifier 不會在跳轉後遺失)
+
 class StreamlitSessionStorage:
+    """讓 supabase/auth-py 能把 PKCE verifier 與 session token 存在 Streamlit 的 session_state 內。"""
+
     def __init__(self):
         if "supabase_auth_storage" not in st.session_state:
             st.session_state.supabase_auth_storage = {}
+
     def get_item(self, key):
         return st.session_state.supabase_auth_storage.get(key)
+
     def set_item(self, key, value):
         st.session_state.supabase_auth_storage[key] = value
+
     def remove_item(self, key):
         if key in st.session_state.supabase_auth_storage:
             del st.session_state.supabase_auth_storage[key]
 
+
 # 建立專用於登入驗證的 Client
 # 使用 st.session_state 搭配 StreamlitSessionStorage 確保狀態持久化
-if 'auth_client' not in st.session_state:
+if "auth_client" not in st.session_state:
     try:
         url = st.secrets["SUPABASE_URL"]
         key = st.secrets["SUPABASE_KEY"]
-        # 關鍵：使用自訂 storage
+    except Exception:
+        st.error("❌ 找不到 SUPABASE_URL / SUPABASE_KEY。請在 Streamlit secrets 設定。")
+        st.stop()
+
+    try:
         st.session_state.auth_client = create_client(
-    url, key,
-    options=ClientOptions(storage=StreamlitSessionStorage(), flow_type="pkce")
-)
-
-
+            url,
+            key,
+            options=ClientOptions(
+                storage=StreamlitSessionStorage(),
+                flow_type="pkce",
+            ),
+        )
     except Exception as e:
         st.error(f"❌ Auth Client 初始化失敗: {e}")
         st.stop()
 
+
 def get_query_params():
-    try: return st.query_params
-    except: return st.experimental_get_query_params()
+    try:
+        return st.query_params
+    except Exception:
+        return st.experimental_get_query_params()
+
 
 def clear_url():
-    try: st.query_params.clear()
-    except: st.experimental_set_query_params()
+    try:
+        st.query_params.clear()
+    except Exception:
+        st.experimental_set_query_params()
 
-
-from urllib.parse import urlparse, parse_qs
-import json
-import streamlit.components.v1 as components
-import time
-
-# 用 state 當 key 暫存 PKCE verifier（避免 Streamlit OAuth 跳轉後 session_state 遺失）
-OAUTH_PKCE_STORE = {}
 
 def _first(v):
     """把 query param 的值統一成單一字串"""
@@ -90,9 +106,63 @@ def _first(v):
         return v[0] if v else None
     return v
 
+
+def _find_code_verifier(storage: dict):
+    """從 storage 找到 (verifier_key, verifier_value)"""
+    if not isinstance(storage, dict):
+        return None, None
+
+    # 先嘗試常見 key
+    common_keys = [
+        "supabase.auth.token-code-verifier",
+        "supabase.auth.token-code_verifier",
+        "code_verifier",
+        "code-verifier",
+    ]
+    for k in common_keys:
+        v = storage.get(k)
+        if isinstance(v, str) and v.strip():
+            return k, v
+
+    # 再嘗試所有包含 verifier 的 key
+    for k, v in storage.items():
+        if not v:
+            continue
+        lk = str(k).lower()
+        if "code-verifier" in lk or "code_verifier" in lk or "verifier" in lk:
+            vv = str(v)
+            if vv.strip():
+                return k, vv
+
+    return None, None
+
+
+def _inject_cv_into_redirect_to(oauth_url: str, cv_key: str, cv_value: str) -> str:
+    """把 code_verifier 放到 oauth_url 的 redirect_to 裡（以 cv/cvk query 帶回）"""
+    u = urlparse(oauth_url)
+    qs = parse_qs(u.query)
+
+    redirect_to = qs.get("redirect_to", [None])[0] or qs.get("redirectTo", [None])[0]
+    if not redirect_to:
+        return oauth_url
+
+    ru = urlparse(redirect_to)
+    rqs = parse_qs(ru.query)
+    rqs["cv"] = [cv_value]
+    rqs["cvk"] = [cv_key]
+
+    new_redirect_to = urlunparse(ru._replace(query=urlencode(rqs, doseq=True)))
+
+    if "redirect_to" in qs:
+        qs["redirect_to"] = [new_redirect_to]
+    elif "redirectTo" in qs:
+        qs["redirectTo"] = [new_redirect_to]
+
+    return urlunparse(u._replace(query=urlencode(qs, doseq=True)))
+
+
 def handle_login():
     """處理登入流程與同步（Supabase OAuth code -> session）"""
-
     auth_client = st.session_state.get("auth_client")
     if auth_client is None:
         st.error("❌ auth_client 尚未初始化（st.session_state.auth_client 不存在）")
@@ -109,20 +179,24 @@ def handle_login():
     except Exception:
         pass
 
-    # 2) 處理 OAuth 回調：URL query 內的 code/state
+    # 2) 處理 OAuth 回調：URL query 內的 code + (cv/cvk)
     params = get_query_params()
     code = _first(params.get("code"))
-    state = _first(params.get("state"))
+    cv = _first(params.get("cv"))
+    cvk = _first(params.get("cvk"))
 
     if code:
         try:
-            # ✅ (重要) 若有 state，就把對應的 code_verifier 放回 supabase_auth_storage
-            if state and state in OAUTH_PKCE_STORE:
-                info = OAUTH_PKCE_STORE.pop(state, None)
-                if info:
-                    if "supabase_auth_storage" not in st.session_state:
-                        st.session_state.supabase_auth_storage = {}
-                    st.session_state.supabase_auth_storage[info["key"]] = info["verifier"]
+            # ✅ 若有 cv，就先把 verifier 放回 storage，讓 exchange_code_for_session 找得到
+            if cv:
+                if "supabase_auth_storage" not in st.session_state:
+                    st.session_state.supabase_auth_storage = {}
+
+                if cvk:
+                    st.session_state.supabase_auth_storage[cvk] = cv
+
+                # 再保險：補一個常見 key（不同版本可能會用到）
+                st.session_state.supabase_auth_storage["supabase.auth.token-code-verifier"] = cv
 
             # ✅ 重要：Python 版用 dict 參數，不要傳純字串
             res = auth_client.auth.exchange_code_for_session({"auth_code": code})
@@ -147,12 +221,14 @@ def handle_login():
             st.write("Query params:", params)
             st.stop()
 
+
 def show_login_UI():
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         st.title("🔐 全球資產管理系統 V7.5")
         st.markdown("### 請登入以存取您的個人資產數據")
 
+        # 預設使用 secrets 的雲端網址，否則退回 localhost（僅本機測試用）
         try:
             default_redirect_url = st.secrets["REDIRECT_URL"]
         except Exception:
@@ -161,76 +237,62 @@ def show_login_UI():
         with st.expander("⚙️ 設定登入回調網址 (若無法登入請檢查)", expanded=False):
             redirect_url = st.text_input("Redirect URL", value=default_redirect_url).strip()
 
+            if ("localhost" in redirect_url) or ("127.0.0.1" in redirect_url):
+                st.warning(
+                    "⚠️ 你目前的 Redirect URL 是 localhost。\n\n"
+                    "如果你部署在 Streamlit Cloud，這裡必須填你的雲端網址，例如：\n"
+                    "`https://my-wealth-v7.streamlit.app`"
+                )
+
         if st.button("🚀 使用 Google 帳號登入", type="primary", use_container_width=True):
             try:
-                res = st.session_state.auth_client.auth.sign_in_with_oauth({
-                    "provider": "google",
-                    "options": {
-                        "redirect_to": redirect_url,
-                        "query_params": {
-                            "access_type": "offline",
-                            "prompt": "consent select_account"
-                        }
+                res = st.session_state.auth_client.auth.sign_in_with_oauth(
+                    {
+                        "provider": "google",
+                        "options": {
+                            "redirect_to": redirect_url,
+                            "query_params": {
+                                "access_type": "offline",
+                                "prompt": "consent select_account",
+                            },
+                        },
                     }
-                })
+                )
 
                 oauth_url = getattr(res, "url", None)
                 if not oauth_url:
                     st.error("❌ 無法取得 OAuth URL（res.url 為空）")
                     st.stop()
 
-                # --- ✅ 把 PKCE verifier 用 state 暫存起來（跨 session 也能找回） ---
-                parsed = urlparse(oauth_url)
-                qs = parse_qs(parsed.query)
-                state = qs.get("state", [None])[0]
-
-                storage = st.session_state.get("supabase_auth_storage", {})
-                verifier_key = None
-                for k in storage.keys():
-                    lk = str(k).lower()
-                    if "code-verifier" in lk or "code_verifier" in lk:
-                        verifier_key = k
-                        break
-
-                if not state:
-                    st.error("❌ OAuth URL 裡沒有 state，無法暫存 PKCE verifier")
-                    st.code(oauth_url)
-                    st.stop()
-
-                if not verifier_key or not storage.get(verifier_key):
-                    st.error("❌ 找不到 code_verifier（storage 裡沒有 verifier）")
+                # ✅ 取得 code_verifier（此時通常已被 SDK 存進 storage）
+                storage = st.session_state.get("supabase_auth_storage", {}) or {}
+                cvk, cv = _find_code_verifier(storage)
+                if not cvk or not cv:
+                    st.error("❌ 找不到 PKCE code_verifier（supabase_auth_storage 內沒有 verifier）")
                     st.write("storage keys:", list(storage.keys()))
                     st.stop()
 
-                OAUTH_PKCE_STORE[state] = {
-                    "key": verifier_key,
-                    "verifier": storage.get(verifier_key),
-                    "ts": time.time(),
-                }
+                # ✅ 把 verifier 注入 redirect_to query，讓回跳時帶回來
+                oauth_url2 = _inject_cv_into_redirect_to(oauth_url, str(cvk), str(cv))
 
-                # 清理太舊的暫存（10 分鐘）
-                now = time.time()
-                for s, info in list(OAUTH_PKCE_STORE.items()):
-                    if now - info.get("ts", 0) > 600:
-                        OAUTH_PKCE_STORE.pop(s, None)
-
-                # ✅ 同分頁自動跳轉（降低 verifier 遺失機率）
+                # ✅ 同分頁自動跳轉（避免開新分頁造成 session 遺失）
                 components.html(
                     f"""
                     <script>
-                      window.location.href = {json.dumps(oauth_url)};
+                      window.location.href = {json.dumps(oauth_url2)};
                     </script>
                     """,
                     height=0,
                 )
 
                 # 保底：若瀏覽器擋 script，仍提供可點連結
-                st.markdown(f"[👉 若未自動跳轉，請點此登入 Google]({oauth_url})")
+                st.markdown(f"[👉 若未自動跳轉，請點此登入 Google]({oauth_url2})")
                 st.stop()
 
             except Exception as e:
                 st.error(f"❌ 初始化失敗: {e}")
                 st.stop()
+
 
 # --- 執行登入檢查 ---
 handle_login()
@@ -238,7 +300,6 @@ handle_login()
 if not st.session_state.user:
     show_login_UI()
     st.stop()
-
 
 
 # ==========================================
