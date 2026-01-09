@@ -8,6 +8,7 @@ import plotly.graph_objects as go
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import json
 import streamlit.components.v1 as components
+import requests
 
 # --- 關鍵匯入 ---
 # 引入 utils 中的 update_supabase_session 來同步權限
@@ -30,6 +31,297 @@ from logic import fetch_all_data, calculate_detailed_metrics, clean_df, save_dai
 
 # --- 1. 頁面基礎設定 ---
 st.set_page_config(page_title="全球資產管理系統 V7.5", layout="wide")
+# ==========================================
+#      🇹🇼 台股代碼 -> 中文名稱（快取）
+# ==========================================
+@st.cache_resource(ttl=86400)
+def get_twse_stock_map():
+    """從證交所抓取台股代碼與中文名稱對照表（快取 1 天）"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    }
+    url = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
+    mp = {}
+    try:
+        res = requests.get(url, headers=headers, timeout=20)
+        # 證交所頁面常見 cp950/big5 編碼
+        res.encoding = "cp950"
+        # 使用 html5lib（requirements 已包含 html5lib），避免 lxml 依賴
+        dfs = pd.read_html(res.text, flavor="html5lib")
+        if not dfs:
+            return mp
+        df = dfs[0]
+        col0 = df.columns[0]
+        for raw in df[col0].dropna():
+            s = str(raw).replace("　", " ").strip()
+            if not s or "有價證券代號及名稱" in s:
+                continue
+            if " " not in s:
+                continue
+            code, name = s.split(" ", 1)
+            code = code.strip().upper()
+            name = name.strip()
+            # 排除分類列（例如「股票」「ETF」等）
+            if not code or not any(ch.isdigit() for ch in code):
+                continue
+            mp[code] = name
+            mp[f"{code}.TW"] = name
+    except Exception as e:
+        # 不要在這裡 st.error，避免打斷主流程
+        print(f"TWSE 清單抓取失敗: {e}")
+    return mp
+
+def get_tw_stock_name(code: str):
+    """回傳台股中文名稱；查不到則回傳 None"""
+    base = str(code).strip().upper().replace(".TW", "")
+    mp = get_twse_stock_map()
+    return mp.get(base)
+
+def _format_dt_series(s: pd.Series) -> pd.Series:
+    """把時間欄位格式化為 YYYY-MM-DD HH:MM（支援 timezone-aware / naive）"""
+    dt = pd.to_datetime(s, errors="coerce")
+    try:
+        if getattr(dt.dt, "tz", None) is not None:
+            dt = dt.dt.tz_convert("Asia/Taipei").dt.tz_localize(None)
+    except Exception:
+        pass
+    return dt.dt.strftime("%Y-%m-%d %H:%M")
+
+def _normalize_id(v):
+    if v is None:
+        return None
+    try:
+        if isinstance(v, float) and pd.isna(v):
+            return None
+    except Exception:
+        pass
+    try:
+        return int(v)
+    except Exception:
+        return str(v)
+
+def _safe_float(v, default=0.0):
+    try:
+        if v is None:
+            return default
+        if isinstance(v, float) and pd.isna(v):
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+def _delete_rows_by_ids(table_name: str, ids: list):
+    """依 id 刪除多筆資料（Supabase PostgREST）"""
+    ids = [i for i in ids if i is not None]
+    if not ids:
+        return
+    try:
+        data_client.table(table_name).delete().in_("id", ids).execute()
+    except Exception:
+        # fallback: 逐筆刪除
+        for _id in ids:
+            data_client.table(table_name).delete().eq("id", _id).execute()
+# ==========================================
+#      📝 Data Editor 同步（編輯/刪除 -> Supabase）
+# ==========================================
+
+def _sync_liabilities(original_df: pd.DataFrame, edited_df_zh: pd.DataFrame):
+    """同步『負債管理』表格：支援編輯、刪除、（可選）新增"""
+    if edited_df_zh is None:
+        return
+
+    inv = {"負債類別": "category", "項目名稱": "name", "金額(TWD)": "amount"}
+    df = edited_df_zh.rename(columns=inv).copy()
+
+    if "id" not in df.columns:
+        st.error("❌ 負債表格缺少 id 欄位，無法同步")
+        return
+
+    # 1) 刪除：原本有、現在沒有的 id
+    orig_ids = set()
+    if original_df is not None and (not original_df.empty) and "id" in original_df.columns:
+        orig_ids = set(_normalize_id(x) for x in original_df["id"].dropna())
+    new_ids = set(_normalize_id(x) for x in df["id"].dropna())
+    del_ids = [i for i in orig_ids if i not in new_ids]
+    _delete_rows_by_ids("liabilities", del_ids)
+
+    # 2) 更新 / 新增
+    now_iso = datetime.now().isoformat()
+    user_id = st.session_state.user_id
+
+    for _, row in df.iterrows():
+        rid = _normalize_id(row.get("id"))
+        name = str(row.get("name") or "").strip()
+        if not name:
+            continue  # 忽略空白列
+
+        cat = str(row.get("category") or "").strip() or "其他"
+        amt = _safe_float(row.get("amount"), 0.0)
+
+        if rid is None:
+            # 新增：用 upsert（避免重複 name）
+            data_client.table("liabilities").upsert(
+                {"user_id": user_id, "category": cat, "name": name, "amount": amt, "updated_at": now_iso},
+                on_conflict="user_id, name",
+            ).execute()
+        else:
+            data_client.table("liabilities").update(
+                {"category": cat, "name": name, "amount": amt, "updated_at": now_iso}
+            ).eq("id", rid).execute()
+
+def _sync_liquidity(original_df: pd.DataFrame, edited_df_zh: pd.DataFrame):
+    """同步『流動資金』表格：支援編輯、刪除、（可選）新增"""
+    if edited_df_zh is None:
+        return
+
+    inv = {"帳戶名稱": "account_name", "金額(TWD)": "amount"}
+    df = edited_df_zh.rename(columns=inv).copy()
+
+    if "id" not in df.columns:
+        st.error("❌ 流動資金表格缺少 id 欄位，無法同步")
+        return
+
+    orig_ids = set()
+    if original_df is not None and (not original_df.empty) and "id" in original_df.columns:
+        orig_ids = set(_normalize_id(x) for x in original_df["id"].dropna())
+    new_ids = set(_normalize_id(x) for x in df["id"].dropna())
+    del_ids = [i for i in orig_ids if i not in new_ids]
+    _delete_rows_by_ids("liquidity", del_ids)
+
+    now_iso = datetime.now().isoformat()
+    user_id = st.session_state.user_id
+
+    for _, row in df.iterrows():
+        rid = _normalize_id(row.get("id"))
+        acc = str(row.get("account_name") or "").strip()
+        if not acc:
+            continue
+
+        amt = _safe_float(row.get("amount"), 0.0)
+
+        if rid is None:
+            data_client.table("liquidity").upsert(
+                {"user_id": user_id, "account_name": acc, "amount": amt, "updated_at": now_iso},
+                on_conflict="user_id, account_name",
+            ).execute()
+        else:
+            data_client.table("liquidity").update(
+                {"account_name": acc, "amount": amt, "updated_at": now_iso}
+            ).eq("id", rid).execute()
+
+def _sync_income_history(original_df: pd.DataFrame, edited_df_zh: pd.DataFrame):
+    """同步『收入』表格：支援編輯、刪除、（可選）新增"""
+    if edited_df_zh is None:
+        return
+
+    df = edited_df_zh.copy()
+    # 顯示用欄位，不回寫資料庫
+    if "上傳時間" in df.columns:
+        df = df.drop(columns=["上傳時間"])
+
+    if "id" not in df.columns:
+        st.error("❌ 收入表格缺少 id 欄位，無法同步")
+        return
+
+    orig_ids = set()
+    if original_df is not None and (not original_df.empty) and "id" in original_df.columns:
+        orig_ids = set(_normalize_id(x) for x in original_df["id"].dropna())
+    new_ids = set(_normalize_id(x) for x in df["id"].dropna())
+    del_ids = [i for i in orig_ids if i not in new_ids]
+    _delete_rows_by_ids("income_history", del_ids)
+
+    user_id = st.session_state.user_id
+
+    for _, row in df.iterrows():
+        rid = _normalize_id(row.get("id"))
+        ann = row.get("年收入")
+        note = str(row.get("備註") or "").strip()
+
+        if ann is None or (isinstance(ann, float) and pd.isna(ann)):
+            # 忽略空白列
+            if rid is None:
+                continue
+            ann_val = None
+        else:
+            try:
+                ann_val = int(float(ann))
+            except Exception:
+                ann_val = None
+
+        if rid is None:
+            if ann_val is None:
+                continue
+            data_client.table("income_history").insert(
+                {"user_id": user_id, "紀錄日期": datetime.now().isoformat(), "年收入": ann_val, "備註": note}
+            ).execute()
+        else:
+            payload = {}
+            if ann_val is not None:
+                payload["年收入"] = ann_val
+            payload["備註"] = note
+            if payload:
+                data_client.table("income_history").update(payload).eq("id", rid).execute()
+
+def _sync_transactions(original_df: pd.DataFrame, edited_df: pd.DataFrame):
+    """同步『交易』表格：支援編輯、刪除、（可選）新增"""
+    if edited_df is None:
+        return
+
+    df = edited_df.copy()
+    # 顯示用欄位，不回寫資料庫
+    if "台股名稱" in df.columns:
+        df = df.drop(columns=["台股名稱"])
+
+    if "id" not in df.columns:
+        st.error("❌ 交易表格缺少 id 欄位，無法同步")
+        return
+
+    orig_ids = set()
+    if original_df is not None and (not original_df.empty) and "id" in original_df.columns:
+        orig_ids = set(_normalize_id(x) for x in original_df["id"].dropna())
+    new_ids = set(_normalize_id(x) for x in df["id"].dropna())
+    del_ids = [i for i in orig_ids if i not in new_ids]
+    _delete_rows_by_ids("transactions", del_ids)
+
+    user_id = st.session_state.user_id
+
+    for _, row in df.iterrows():
+        rid = _normalize_id(row.get("id"))
+        t_type = str(row.get("類型") or "").strip()
+        t_cat = str(row.get("類別") or "").strip()
+        ticker = str(row.get("代碼") or "").upper().strip()
+        qty = _safe_float(row.get("數量"), 0.0)
+        price = _safe_float(row.get("單價"), 0.0)
+        date_v = row.get("日期")
+
+        # 忽略空白列
+        if not ticker or qty <= 0:
+            if rid is None:
+                continue
+
+        try:
+            date_iso = pd.to_datetime(date_v, errors="coerce").date().isoformat() if date_v else None
+        except Exception:
+            date_iso = None
+
+        payload = {
+            "user_id": user_id,
+            "類型": t_type,
+            "類別": t_cat,
+            "代碼": ticker,
+            "數量": qty,
+            "單價": price,
+            "日期": date_iso,
+        }
+
+        # 移除 None，避免寫入失敗
+        payload = {k: v for k, v in payload.items() if v is not None}
+
+        if rid is None:
+            data_client.table("transactions").insert(payload).execute()
+        else:
+            payload.pop("user_id", None)  # 更新時不必動到 user_id
+            data_client.table("transactions").update(payload).eq("id", rid).execute()
 
 # ==========================================
 #      🔐 登入邏輯 (Session Storage + Sync)
@@ -348,6 +640,17 @@ if not st.session_state.transactions.empty:
     holdings_df, realized_all, detailed_tx_global = calculate_detailed_metrics(st.session_state.transactions, current_ex_rate)
     
     if not holdings_df.empty:
+        # ✅ 台股代碼 -> 中文名稱（第一次會抓取全量清單並快取）
+        tw_map = get_twse_stock_map()
+        if tw_map:
+            mask_tw = holdings_df['類別'] == '台股'
+            if mask_tw.any():
+                def _tw_disp(code):
+                    base = str(code).upper().replace('.TW', '').strip()
+                    name = tw_map.get(base)
+                    return f"{name} ({base})" if name else base
+                holdings_df.loc[mask_tw, '顯示名稱'] = holdings_df.loc[mask_tw, '代碼'].apply(_tw_disp)
+
         holdings_df['現價'] = holdings_df['代碼'].map(prices).fillna(0)
         holdings_df['匯率'] = holdings_df['類別'].apply(lambda x: current_ex_rate if x != '台股' else 1.0)
         holdings_df['市值(TWD)'] = holdings_df['現價'] * holdings_df['持倉數量'] * holdings_df['匯率']
@@ -397,6 +700,14 @@ with st.sidebar:
         t_type = st.radio("交易類型", ["買入", "賣出"], horizontal=True)
         t_cat = st.selectbox("資產類別", ["台股", "美股", "加密貨幣"])
         t_ticker = st.text_input("標的代碼 (如 2330, TSLA)").upper().strip()
+
+        # 台股代碼即時顯示中文名稱（第一次會抓取全量清單並快取）
+        if t_cat == "台股" and t_ticker:
+            tw_name = get_tw_stock_name(t_ticker)
+            if tw_name:
+                st.caption(f"📌 股票名稱：{tw_name}")
+            else:
+                st.caption("⚠️ 查無此台股代碼（仍可存入）")
         t_qty = st.number_input("數量", min_value=0.0, format="%.4f")
         t_price = st.number_input("單價", min_value=0.0, format="%.4f")
         t_date = st.date_input("交易日期", datetime.now())
@@ -503,7 +814,45 @@ with tab_liab:
                 data_client.table("liabilities").upsert({"user_id": st.session_state.user_id, "category": l_cat, "name": l_name if l_name else l_cat, "amount": l_amt, "updated_at": datetime.now().isoformat()}, on_conflict='user_id, name').execute()
                 fetch_all_data(); st.rerun()
     with l_col2:
-        if not st.session_state.liabilities_df.empty: st.dataframe(st.session_state.liabilities_df[['category', 'name', 'amount', 'updated_at']], use_container_width=True)
+        st.subheader("📋 負債明細（可編輯 / 刪除）")
+        if st.session_state.liabilities_df.empty:
+            st.info("目前尚無負債資料")
+        else:
+            liab_src = st.session_state.liabilities_df.copy()
+
+            # 上傳時間 / 更新時間：只顯示到「年-月-日 時:分」
+            if "updated_at" in liab_src.columns:
+                liab_src["updated_at"] = _format_dt_series(liab_src["updated_at"])
+
+            disp = liab_src.copy()
+            show_cols = []
+            if "id" in disp.columns:
+                show_cols.append("id")
+            for c in ["category", "name", "amount", "updated_at"]:
+                if c in disp.columns:
+                    show_cols.append(c)
+            disp = disp[show_cols].rename(columns={
+                "category": "負債類別",
+                "name": "項目名稱",
+                "amount": "金額(TWD)",
+                "updated_at": "更新時間",
+            })
+
+            edited_liab = st.data_editor(
+                disp,
+                use_container_width=True,
+                num_rows="dynamic",
+                disabled=[c for c in ["id", "更新時間"] if c in disp.columns],
+                key="liab_editor",
+            )
+
+            if st.button("💾 儲存負債表格修改", key="save_liab_btn"):
+                try:
+                    _sync_liabilities(liab_src, edited_liab)
+                    fetch_all_data()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ 儲存負債修改失敗：{e}")
 
 # --- Tab 2: 收入與流動資金 (整合您的 PR 分析與我的帳戶管理) ---
 with tab2:
@@ -520,8 +869,45 @@ with tab2:
                     data_client.table("liquidity").upsert({"user_id": st.session_state.user_id, "account_name": acc_name, "amount": acc_amt, "updated_at": datetime.now().isoformat()}, on_conflict='user_id, account_name').execute()
                     fetch_all_data(); st.rerun()
     with liq_col2:
-        if not st.session_state.liquidity_df.empty:
-            st.dataframe(st.session_state.liquidity_df[['account_name', 'amount', 'updated_at']], use_container_width=True)
+        st.subheader("📋 帳戶明細（可編輯 / 刪除）")
+        if st.session_state.liquidity_df.empty:
+            st.info("目前尚無流動資金帳戶資料")
+        else:
+            liq_src = st.session_state.liquidity_df.copy()
+
+            # 上傳時間 / 更新時間：只顯示到「年-月-日 時:分」
+            if "updated_at" in liq_src.columns:
+                liq_src["updated_at"] = _format_dt_series(liq_src["updated_at"])
+
+            disp = liq_src.copy()
+            show_cols = []
+            if "id" in disp.columns:
+                show_cols.append("id")
+            for c in ["account_name", "amount", "updated_at"]:
+                if c in disp.columns:
+                    show_cols.append(c)
+            disp = disp[show_cols].rename(columns={
+                "account_name": "帳戶名稱",
+                "amount": "金額(TWD)",
+                "updated_at": "更新時間",
+            })
+
+            edited_liq = st.data_editor(
+                disp,
+                use_container_width=True,
+                num_rows="dynamic",
+                disabled=[c for c in ["id", "更新時間"] if c in disp.columns],
+                key="liq_editor",
+            )
+
+            if st.button("💾 儲存流動資金表格修改", key="save_liq_btn"):
+                try:
+                    _sync_liquidity(liq_src, edited_liq)
+                    fetch_all_data()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ 儲存流動資金修改失敗：{e}")
+
             st.metric("總流動資金加總", f"NT$ {total_liquidity:,.0f}")
 
     st.divider()
@@ -556,10 +942,41 @@ with tab2:
             st.metric("當前紀錄年收", f"NT$ {curr_ann:,.0f}", help="以最後一筆紀錄為準")
             st.markdown(f"您的年薪領先全台約 **{user_pr}%** 的受薪階級。")
             
-            st.write("歷史紀錄 (可直接編輯)")
-            edited_in = st.data_editor(st.session_state.income_df.copy(), num_rows="dynamic", disabled=['id'])
-            if st.button("🚀 同步更新收入資料"):
-                st.warning("同步功能開發中，建議目前以新增為主。")
+            st.write("歷史紀錄（可編輯 / 刪除）")
+            in_src = st.session_state.income_df.copy()
+
+            # 上傳時間：只顯示到「年-月-日 時:分」
+            if "紀錄日期" in in_src.columns:
+                in_src["上傳時間"] = _format_dt_series(in_src["紀錄日期"])
+            else:
+                in_src["上傳時間"] = ""
+
+            disp_in = in_src.copy()
+            show_cols = []
+            if "id" in disp_in.columns:
+                show_cols.append("id")
+            if "上傳時間" in disp_in.columns:
+                show_cols.append("上傳時間")
+            for c in ["年收入", "備註"]:
+                if c in disp_in.columns:
+                    show_cols.append(c)
+            disp_in = disp_in[show_cols]
+
+            edited_in = st.data_editor(
+                disp_in,
+                num_rows="dynamic",
+                use_container_width=True,
+                disabled=[c for c in ["id", "上傳時間"] if c in disp_in.columns],
+                key="income_editor",
+            )
+
+            if st.button("💾 儲存收入表格修改", key="save_income_btn"):
+                try:
+                    _sync_income_history(in_src, edited_in)
+                    fetch_all_data()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ 儲存收入修改失敗：{e}")
 
 # --- Tab 3: FIRE 規劃 (恢復您的完整介面與說明) ---
 with tab3:
@@ -620,7 +1037,44 @@ with tab3:
 # --- 底部流水帳 ---
 st.divider()
 st.subheader("📜 歷史交易編輯")
-if not st.session_state.transactions.empty:
-    disp_tx = detailed_tx_global.copy().sort_values('日期', ascending=False)
-    disp_tx['日期'] = pd.to_datetime(disp_tx['日期']).dt.date
-    st.data_editor(disp_tx[['id', '日期', '類型', '類別', '代碼', '數量', '單價']], use_container_width=True, disabled=['id'])
+if st.session_state.transactions.empty:
+    st.info("尚無交易紀錄")
+else:
+    tx_src = st.session_state.transactions.copy()
+
+    # 日期欄位統一成 date，方便直接編輯
+    if "日期" in tx_src.columns:
+        tx_src["日期"] = pd.to_datetime(tx_src["日期"], errors="coerce").dt.date
+
+    # 台股代碼 -> 中文名稱（顯示用，不回寫）
+    tx_src["台股名稱"] = ""
+    try:
+        tw_map = get_twse_stock_map()
+        if tw_map and "類別" in tx_src.columns and "代碼" in tx_src.columns:
+            mask = tx_src["類別"] == "台股"
+            if mask.any():
+                def _tw_name_only(code):
+                    base = str(code).upper().replace(".TW", "").strip()
+                    return tw_map.get(base, "")
+                tx_src.loc[mask, "台股名稱"] = tx_src.loc[mask, "代碼"].apply(_tw_name_only)
+    except Exception:
+        pass
+
+    show_cols = [c for c in ["id", "日期", "類型", "類別", "代碼", "台股名稱", "數量", "單價"] if c in tx_src.columns]
+    disp_tx = tx_src[show_cols].sort_values("日期", ascending=False)
+
+    edited_tx = st.data_editor(
+        disp_tx,
+        use_container_width=True,
+        num_rows="dynamic",
+        disabled=[c for c in ["id", "台股名稱"] if c in disp_tx.columns],
+        key="tx_editor",
+    )
+
+    if st.button("💾 儲存交易表格修改", key="save_tx_btn"):
+        try:
+            _sync_transactions(tx_src, edited_tx)
+            fetch_all_data()
+            st.rerun()
+        except Exception as e:
+            st.error(f"❌ 儲存交易修改失敗：{e}")
