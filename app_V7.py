@@ -244,14 +244,104 @@ def _normalize_id(v):
         return str(v)
 
 def _safe_float(v, default=0.0):
+    """安全轉 float：允許字串含逗號(1,000,000) / 空白 / 常見貨幣字樣"""
     try:
         if v is None:
             return default
         if isinstance(v, float) and pd.isna(v):
             return default
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return default
+            # 移除千分位逗號與常見貨幣符號
+            s = s.replace(",", "")
+            s = s.replace("NT$", "").replace("USD", "").replace("$", "").strip()
+            if not s:
+                return default
+            return float(s)
         return float(v)
     except Exception:
         return default
+
+
+
+def _fmt_int_commas(v, blank: str = "") -> str:
+    """格式化金額顯示：每三位數一個逗點（回傳字串）。"""
+    try:
+        if v is None:
+            return blank
+        if isinstance(v, float) and pd.isna(v):
+            return blank
+        if isinstance(v, str) and not v.strip():
+            return blank
+        num = _safe_float(v, default=None)
+        if num is None:
+            return blank
+        return f"{num:,.0f}"
+    except Exception:
+        return str(v) if v is not None else blank
+
+
+def _pill_delta_html(delta_value: float, is_percent: bool = False) -> str:
+    """回傳『橢圓底色 + 上/下箭頭』的 HTML（上漲紅、下跌綠）。"""
+    try:
+        v = float(delta_value)
+    except Exception:
+        v = 0.0
+
+    is_up = v >= 0
+    color = "#D62728" if is_up else "#2CA02C"   # 上漲紅、下跌綠
+    bg = "rgba(214,39,40,0.15)" if is_up else "rgba(44,160,44,0.15)"
+    arrow = "▲" if is_up else "▼"
+    if is_percent:
+        txt = f"{arrow} {v:+.2f}%"
+    else:
+        txt = f"{arrow} {v:+,.0f}"
+
+    return (
+        f"<span style='display:inline-block; padding:2px 10px; border-radius:999px;"
+        f" background:{bg}; color:{color}; font-size:12px; font-weight:700;'>"
+        f"{txt}</span>"
+    )
+
+
+def _aggregate_snapshots_by_scale(df: pd.DataFrame, time_scale: str) -> pd.DataFrame:
+    """依時間尺度(年/月/周/日)聚合 portfolio_snapshots，並以每期最後一筆代表該期趨勢。"""
+    if df is None or df.empty:
+        return df
+
+    d = df.copy()
+    if "snapshot_date" not in d.columns:
+        return d
+
+    d["snapshot_date"] = pd.to_datetime(d["snapshot_date"], errors="coerce")
+    d = d.dropna(subset=["snapshot_date"]).sort_values("snapshot_date")
+    # 正規化到日期（避免誤進入小時級別）
+    d["snapshot_date"] = d["snapshot_date"].dt.normalize()
+
+    if time_scale == "周":
+        # 以週一作為該週起點
+        grp = d["snapshot_date"] - pd.to_timedelta(d["snapshot_date"].dt.weekday, unit="D")
+    elif time_scale == "月":
+        grp = d["snapshot_date"].dt.to_period("M").dt.to_timestamp()
+    elif time_scale == "年":
+        grp = d["snapshot_date"].dt.to_period("Y").dt.to_timestamp()
+    else:  # "日"
+        grp = d["snapshot_date"]
+
+    d["_grp"] = grp
+    value_cols = [c for c in ["net_assets", "market_value", "liquidity_amount"] if c in d.columns]
+    if not value_cols:
+        return d
+
+    out = (
+        d.sort_values("snapshot_date")
+        .groupby("_grp", as_index=False)[value_cols]
+        .last()
+        .rename(columns={"_grp": "snapshot_date"})
+    )
+    return out
 
 def _delete_rows_by_ids(table_name: str, ids: list):
     """依 id 刪除多筆資料（Supabase PostgREST）"""
@@ -387,6 +477,9 @@ def _sync_income_history(original_df: pd.DataFrame, edited_df_zh: pd.DataFrame):
             ann_val = None
         else:
             try:
+                # 允許 "1,234,567" 這類格式
+                if isinstance(ann, str):
+                    ann = ann.replace(",", "").strip()
                 ann_val = int(float(ann))
             except Exception:
                 ann_val = None
@@ -841,7 +934,7 @@ with st.sidebar:
     with st.form("trade_form", clear_on_submit=True):
         st.subheader("📝 新增投資交易")
         t_type = st.radio("交易類型", ["買入", "賣出"], horizontal=True)
-        t_cat = st.selectbox("資產類別", ["台股", "美股", "加密貨幣"])
+        t_cat = st.selectbox("資產類別", ["台股", "美股", "加密貨幣", "貴金屬"])
         t_ticker = st.text_input("標的代碼 (如 2330, TSLA)").upper().strip()
 
         # 台股代碼即時顯示中文名稱（第一次會抓取全量清單並快取）
@@ -884,8 +977,8 @@ with tab1:
     col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
     delta_tag = f"({time_range})" if time_range != "不對比" else None
     
-    with col_m1: st.metric("淨資產 (TWD)", f"NT$ {net_assets:,.0f}", delta=f"{net_delta:,.0f}" if delta_tag else None, help=delta_tag)
-    with col_m2: st.metric("目前流動資金", f"NT$ {total_liquidity:,.0f}", delta=f"{liq_delta:,.0f}" if delta_tag else None)
+    with col_m1: st.metric("淨資產 (TWD)", f"NT$ {net_assets:,.0f}", delta=f"{net_delta:,.0f}" if delta_tag else None, help=delta_tag, delta_color="inverse")
+    with col_m2: st.metric("目前流動資金", f"NT$ {total_liquidity:,.0f}", delta=f"{liq_delta:,.0f}" if delta_tag else None, delta_color="inverse")
     with col_m3:
         m_c = "#D62728" if mkt_delta >= 0 else "#2CA02C"
         delta_str = f"{mkt_delta:+,.0f}" if delta_tag else ""
@@ -900,15 +993,18 @@ with tab1:
     c_l, c_r = st.columns([2, 1])
     with c_l:
         if not st.session_state.snapshots_df.empty:
-            df_plot = st.session_state.snapshots_df.sort_values('snapshot_date')
-            
+            # 讓使用者選擇 X 軸時間尺度（年/月/周/日；不細分到小時）
+            time_scale = st.selectbox("X 軸時間尺度", ["日", "周", "月", "年"], index=0, key="trend_time_scale")
+            df_plot_raw = st.session_state.snapshots_df.sort_values('snapshot_date')
+            df_plot = _aggregate_snapshots_by_scale(df_plot_raw, time_scale)
+
             # 1. 定義中文名稱對照表
             name_map = {
                 'net_assets': '淨資產',
                 'market_value': '市場價值',
                 'liquidity_amount': '流動金額'
             }
-            
+
             # 2. 繪圖
             fig = px.line(
                 df_plot, 
@@ -916,33 +1012,88 @@ with tab1:
                 y=list(name_map.keys()), 
                 title="資產歷史趨勢"
             )
-            
+
             # 3. 強制修改線條名稱
             fig.for_each_trace(lambda t: t.update(name = name_map.get(t.name, t.name)))
-            
+
             # 4. 修改圖例標題
             fig.update_layout(legend_title_text='資產種類')
-            
+
             st.plotly_chart(fig, use_container_width=True)
     with c_r:
         pie_df = pd.DataFrame({"項目": ["投資", "流動資金", "負債"], "金額": [total_market_val, total_liquidity, total_liabilities]})
         st.plotly_chart(px.pie(pie_df, values='金額', names='項目', hole=0.4, color_discrete_sequence=["#ff7f0e", "#2ca02c", "#d62728"]), use_container_width=True)
 
     st.divider()
-    asset_tabs = st.tabs(["🇹🇼 台股", "🇺🇸 美股", "🪙 加密貨幣"])
-    cat_map = {"台股": "🇹🇼 台股", "美股": "🇺🇸 美股", "加密貨幣": "🪙 加密貨幣"}
+    asset_tabs = st.tabs(["🇹🇼 台股", "🇺🇸 美股", "🪙 加密貨幣", "🥇 貴金屬"])
+    cat_map = {"台股": "🇹🇼 台股", "美股": "🇺🇸 美股", "加密貨幣": "🪙 加密貨幣", "貴金屬": "🥇 貴金屬"}
     for i, (internal_cat, display_cat) in enumerate(cat_map.items()):
         with asset_tabs[i]:
             df_sub = holdings_df[holdings_df['類別'] == internal_cat] if not holdings_df.empty else pd.DataFrame()
             if not df_sub.empty:
-                st.plotly_chart(px.bar(df_sub.sort_values('市值(TWD)'), x='市值(TWD)', y='顯示名稱', orientation='h', text_auto='.2s', color='市值(TWD)', title=f"{internal_cat} 標的占比"), use_container_width=True)
-                st.dataframe(df_sub[['顯示名稱', '持倉數量', '平均成本', '現價', '市值(TWD)', '損益(TWD)', '報酬率']].style.format({'市值(TWD)': '{:,.0f}', '損益(TWD)': '{:,.0f}', '報酬率': '{:+.2f}%', '現價': '{:,.2f}', '平均成本': '{:,.2f}'}), use_container_width=True)
+                # 長條圖：同時顯示『市值』與『占總持倉比例』
+                df_bar = df_sub.sort_values('市值(TWD)').copy()
+                denom = total_market_val if total_market_val else df_bar['市值(TWD)'].sum()
+                if denom and denom != 0:
+                    df_bar['占總持倉%'] = (df_bar['市值(TWD)'] / denom) * 100
+                else:
+                    df_bar['占總持倉%'] = 0.0
+                df_bar['標籤'] = df_bar.apply(lambda r: f"NT$ {r['市值(TWD)']:,.0f} ({r['占總持倉%']:.1f}%)", axis=1)
+
+                fig_bar = px.bar(
+                    df_bar,
+                    x='市值(TWD)',
+                    y='顯示名稱',
+                    orientation='h',
+                    text='標籤',
+                    color='市值(TWD)',
+                    hover_data={'市值(TWD)': ':,.0f', '占總持倉%': ':.1f'},
+                    title=f"{internal_cat} 標的占比"
+                )
+                fig_bar.update_traces(textposition='outside')
+                fig_bar.update_xaxes(tickformat=",.0f")
+                st.plotly_chart(fig_bar, use_container_width=True)
+
+                st.dataframe(df_sub[['顯示名稱', '持倉數量', '平均成本', '現價', '市值(TWD)', '損益(TWD)', '報酬率']].style.format({'市值(TWD)': '{:,.0f}', '損益(TWD)': '{:+,.0f}', '報酬率': '{:+.2f}%', '持倉數量': '{:,.4f}', '現價': '{:,.2f}', '平均成本': '{:,.2f}'}), use_container_width=True)
+
                 s_v, s_p, s_c = df_sub['市值(TWD)'].sum(), df_sub['損益(TWD)'].sum(), df_sub['成本(TWD)'].sum()
                 sc1, sc2, sc3 = st.columns(3)
-                sc1.metric("總市值", f"NT$ {s_v:,.0f}")
-                if internal_cat != "台股": sc1.caption(f"📏 換算匯率: 1 USD = {current_ex_rate:.2f} TWD")
-                sc2.metric("總損益", f"NT$ {s_p:,.0f}", delta=f"{s_p:,.0f}")
-                sc3.metric("報酬率", f"{(s_p/s_c*100 if s_c != 0 else 0):.2f}%")
+
+                # 總市值（保留原本顯示，將匯率資訊移到 help，避免與其他元素重疊）
+                sc1.metric(
+                    "總市值",
+                    f"NT$ {s_v:,.0f}",
+                    help=(f"📏 換算匯率: 1 USD = {current_ex_rate:.2f} TWD" if internal_cat != "台股" else None)
+                )
+
+                # 總損益：移除下方小字 delta，改成『橢圓底色 + 箭頭』
+                with sc2:
+                    pnl_pill = _pill_delta_html(s_p, is_percent=False)
+                    st.markdown(
+                        f"""
+                        <div style='padding-top:4px;'>
+                            <div style='font-size:16px; color:gray; margin-bottom:2px;'>總損益</div>
+                            <div style='font-size:34px; font-weight:700; line-height:1.1;'>NT$ {abs(s_p):,.0f}</div>
+                            <div style='margin-top:6px;'>{pnl_pill}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+
+                # 報酬率：同樣用 pill 顯示上/下箭頭
+                with sc3:
+                    roi = (s_p / s_c * 100) if s_c != 0 else 0.0
+                    roi_pill = _pill_delta_html(roi, is_percent=True)
+                    st.markdown(
+                        f"""
+                        <div style='padding-top:4px;'>
+                            <div style='font-size:16px; color:gray; margin-bottom:2px;'>報酬率</div>
+                            <div style='font-size:34px; font-weight:700; line-height:1.1;'>{abs(roi):.2f}%</div>
+                            <div style='margin-top:6px;'>{roi_pill}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
 
 # --- Tab: 負債管理 ---
 with tab_liab:
@@ -981,11 +1132,17 @@ with tab_liab:
                 "updated_at": "更新時間",
             })
 
+
+            # 金額顯示：每三個位數一個逗點
+            if "金額(TWD)" in disp.columns:
+                disp["金額(TWD)"] = disp["金額(TWD)"].apply(_fmt_int_commas)
+
             edited_liab = st.data_editor(
                 disp,
                 use_container_width=True,
                 num_rows="dynamic",
                 disabled=[c for c in ["id", "更新時間"] if c in disp.columns],
+                column_config=({"id": None} if "id" in disp.columns else None),
                 key="liab_editor",
             )
 
@@ -996,6 +1153,22 @@ with tab_liab:
                     st.rerun()
                 except Exception as e:
                     st.error(f"❌ 儲存負債修改失敗：{e}")
+
+
+            # 圓餅圖：各負債項目占比
+            st.divider()
+            st.subheader("🥧 負債項目占比")
+            pie_src = liab_src.copy()
+            if (not pie_src.empty) and ("name" in pie_src.columns) and ("amount" in pie_src.columns):
+                pie_data = pie_src.groupby("name", as_index=False)["amount"].sum()
+                pie_data = pie_data[pie_data["amount"] > 0]
+                if not pie_data.empty:
+                    fig_liab_pie = px.pie(pie_data, values="amount", names="name", hole=0.4)
+                    st.plotly_chart(fig_liab_pie, use_container_width=True)
+                else:
+                    st.info("目前沒有可繪製的負債占比資料")
+            else:
+                st.info("目前沒有可繪製的負債占比資料")
 
 # --- Tab 2: 收入與流動資金 (整合您的 PR 分析與我的帳戶管理) ---
 with tab2:
@@ -1035,11 +1208,17 @@ with tab2:
                 "updated_at": "更新時間",
             })
 
+
+            # 金額顯示：每三個位數一個逗點
+            if "金額(TWD)" in disp.columns:
+                disp["金額(TWD)"] = disp["金額(TWD)"].apply(_fmt_int_commas)
+
             edited_liq = st.data_editor(
                 disp,
                 use_container_width=True,
                 num_rows="dynamic",
                 disabled=[c for c in ["id", "更新時間"] if c in disp.columns],
+                column_config=({"id": None} if "id" in disp.columns else None),
                 key="liq_editor",
             )
 
@@ -1105,11 +1284,16 @@ with tab2:
                     show_cols.append(c)
             disp_in = disp_in[show_cols]
 
+            # 金額顯示：每三個位數一個逗點
+            if "年收入" in disp_in.columns:
+                disp_in["年收入"] = disp_in["年收入"].apply(_fmt_int_commas)
+
             edited_in = st.data_editor(
                 disp_in,
                 num_rows="dynamic",
                 use_container_width=True,
                 disabled=[c for c in ["id", "上傳時間"] if c in disp_in.columns],
+                column_config=({"id": None} if "id" in disp_in.columns else None),
                 key="income_editor",
             )
 
